@@ -396,7 +396,8 @@ function onDisconnect(){
 let renderer=null,scene,camera,mode=null,xrSession=null,hitSrc=null,lastT=0;
 let reticle,areaGrp=null,sonar,virtEnv,outlineMat;
 const pPos=new THREE.Vector3(0,1.5,0),pQuat=new THREE.Quaternion(),pFwd=new THREE.Vector3(0,0,-1),tmpV=new THREE.Vector3(),invQ=new THREE.Quaternion();
-const B={floorY:0,cx:0,cz:0,R:1.8,spawns:[],retOK:false,bReady:false,rReady:false,step:'floor'};
+const B={floorY:0,cx:0,cz:0,R:1.8,spawns:[],retOK:false,bReady:false,rReady:false,step:'floor',noHit:false,floorKnown:false,estFloor:null,poseOK:false};
+let arMsg='';
 const newGame=()=>({phase:'setup',t:0,hp:100,scrap:20,ammo:12,weapon:0,zombies:[],pickups:[],proj:[],kills:0,downs:0,down:false,downT:0,pingT:0,nextSpawn:E.first,nextId:1,fireCd:0,sendT:0,setupT:0,heartT:0,firing:false,outT:0,sh:{}});
 let G=newGame();
 let vYaw=0,vPitch=-0.6;
@@ -408,7 +409,7 @@ async function enterBantay(){
   let ok=false;
   try{ok=!!(navigator.xr&&await navigator.xr.isSessionSupported('immersive-ar'));}catch(e){}
   $('#btnAR').disabled=!ok;
-  $('#arNote').textContent=ok?'Kaya ng phone mo ang AR. 👍':'Hindi kaya ng browser na ito ang AR (kailangan ng Chrome sa Android na may ARCore). Gamitin muna ang Virtual mode.';
+  $('#arNote').textContent=arMsg||(ok?'Kaya ng phone mo ang AR. 👍':'Hindi kaya ng browser na ito ang AR (kailangan ng Chrome sa Android na may ARCore). Gamitin muna ang Virtual mode.');arMsg='';
 }
 $('#bIntroBack').onclick=()=>{if(solo){solo=false;myRole=null;show('home');}};
 $('#btnAR').onclick=startAR;
@@ -457,15 +458,24 @@ async function startAR(){
   ac();initThree();
   const root=$('#bRoot');root.style.display='block';
   root.addEventListener('beforexrselect',e=>e.preventDefault());
-  try{
-    xrSession=await navigator.xr.requestSession('immersive-ar',{requiredFeatures:['hit-test'],optionalFeatures:['dom-overlay'],domOverlay:{root}});
-  }catch(e){root.style.display='none';$('#arNote').textContent='Hindi nabuksan ang AR: '+(e.message||e);return;}
+  const configs=[
+    {requiredFeatures:['hit-test'],optionalFeatures:['dom-overlay','local-floor'],domOverlay:{root}},
+    {optionalFeatures:['hit-test','dom-overlay','local-floor'],domOverlay:{root}},
+    {optionalFeatures:['dom-overlay'],domOverlay:{root}}
+  ];
+  let lastErr=null;xrSession=null;
+  for(const cfg of configs){try{xrSession=await navigator.xr.requestSession('immersive-ar',cfg);break;}catch(e){lastErr=e;}}
+  if(!xrSession){root.style.display='none';$('#arNote').textContent='Hindi nabuksan ang AR ('+((lastErr&&lastErr.message)||lastErr)+'). I-install o i-update ang “Google Play Services for AR” sa Play Store, i-restart ang Chrome, at subukan ulit. Pwede munang gamitin ang Virtual mode.';return;}
   mode='ar';scene.background=null;scene.fog=null;virtEnv.visible=false;
-  renderer.xr.setReferenceSpaceType('local');
+  let refType='local';
+  try{await xrSession.requestReferenceSpace('local-floor');refType='local-floor';}catch(e){}
+  renderer.xr.setReferenceSpaceType(refType);
   await renderer.xr.setSession(xrSession);
-  const viewer=await xrSession.requestReferenceSpace('viewer');
-  hitSrc=await xrSession.requestHitTestSource({space:viewer});
+  hitSrc=null;
+  try{const viewer=await xrSession.requestReferenceSpace('viewer');hitSrc=await xrSession.requestHitTestSource({space:viewer});}catch(e){hitSrc=null;}
+  B.noHit=!hitSrc;B.floorKnown=refType==='local-floor';B.estFloor=null;B.poseOK=false;
   xrSession.addEventListener('end',()=>{xrSession=null;hitSrc=null;teardown();});
+  if(!xrSession.domOverlayState){arMsg='Bumukas ang AR pero hindi maipakita ng phone ang mga button sa ibabaw ng camera. Gamitin muna ang Virtual mode, o i-update ang Chrome.';xrSession.end();return;}
   renderer.domElement.style.display='block';
   beginPlay();
 }
@@ -525,7 +535,8 @@ function addSpawn(x,z){
 function sendSetup(){send({t:'setup',c:[r2(B.cx),r2(B.cz)],r:B.R,sp:B.spawns.map(s=>[r2(s.x),r2(s.z)])});}
 function sAct(a,arg){
   ac();
-  if(a==='floor'){if(!B.retOK)return;B.floorY=mode==='ar'?reticle.position.y-0.003:0;B.cx=pPos.x;B.cz=pPos.z;buildArea();B.step='area';sendSetup();SFX.pickup();}
+  if(a==='fup'||a==='fdn'){if(B.estFloor!==null)B.estFloor+=a==='fup'?0.05:-0.05;return;}
+  if(a==='floor'){if(!B.retOK)return;B.floorY=mode==='ar'?reticle.position.y-0.004:0;B.cx=pPos.x;B.cz=pPos.z;buildArea();B.step='area';sendSetup();SFX.pickup();}
   else if(a==='size'){B.R=+arg;buildArea();sendSetup();}
   else if(a==='areaok'){B.step='spawns';}
   else if(a==='mark'){if(!B.retOK||B.spawns.length>=4)return;addSpawn(reticle.position.x,reticle.position.z);sendSetup();SFX.pickup();}
@@ -547,7 +558,8 @@ function renderSetup(){
   }else if(B.step==='floor'){
     step='Hakbang 1 ng 3 · Sahig';
     txt=mode==='ar'?'Itutok ang phone sa sahig at dahan-dahang igalaw hanggang lumabas ang dilaw na bilog. Tumayo sa gitna ng kwarto.':'Virtual mode: i-drag ang screen para lumingon. Itutok sa sahig.';
-    btns=b('floor','Ito ang sahig');
+    if(mode==='ar'&&B.noHit){txt='Hindi kaya ng phone na ito ang awtomatikong paghanap ng sahig, kaya tinantiya namin. Itutok sa sahig: kung lumulutang o nakabaon ang dilaw na bilog, ayusin gamit ang ▲ ▼.';btns=b('fup','▲','ghost sm')+b('fdn','▼','ghost sm')+b('floor','Ito ang sahig');}
+    else btns=b('floor','Ito ang sahig');
   }else if(B.step==='area'){
     step='Hakbang 2 ng 3 · Ligtas na lugar';
     txt='Ito ang ligtas mong lugar. Siguraduhing walang upuan, mesa o laruan sa loob ng bilog. Dito ka lang gagalaw.';
@@ -797,10 +809,12 @@ function updReticle(frame){
   const need=G.phase==='setup'&&(B.step==='floor'||B.step==='spawns');
   B.retOK=false;
   if(need){
-    if(mode==='ar'&&B.step==='floor'){
+    if(mode==='ar'&&B.step==='floor'&&B.noHit&&B.estFloor===null&&B.poseOK){B.estFloor=B.floorKnown?0:pPos.y-1.35;}
+    if(mode==='ar'&&B.step==='floor'&&!B.noHit){
       if(hitSrc&&frame){const res=frame.getHitTestResults(hitSrc);if(res.length){const pose=res[0].getPose(renderer.xr.getReferenceSpace());if(pose){const m=pose.transform.matrix;if(m[5]>0.75){reticle.position.set(m[12],m[13]+0.003,m[14]);B.retOK=true;}}}}
     }else{
-      const fy=mode==='ar'?B.floorY:0;
+      const fy=mode!=='ar'?0:(B.step==='floor'?B.estFloor:B.floorY);
+      if(fy===null||fy===undefined){reticle.visible=false;return;}
       if(pFwd.y<-0.06){const t=(fy-pPos.y)/pFwd.y;if(t>0&&t<9){reticle.position.set(pPos.x+pFwd.x*t,fy+0.004,pPos.z+pFwd.z*t);B.retOK=true;}}
     }
   }
@@ -850,7 +864,7 @@ function loop(time,frame){
   const dt=lastT?Math.min(0.05,(time-lastT)/1000):0.016;lastT=time;
   if(!mode)return;
   if(mode==='virtual'){camera.position.set(0,1.5,0);camera.rotation.set(vPitch,vYaw,0);camera.updateMatrixWorld();pPos.copy(camera.position);pQuat.copy(camera.quaternion);}
-  else if(frame){const vp=frame.getViewerPose(renderer.xr.getReferenceSpace());if(vp){const p=vp.transform.position,o=vp.transform.orientation;pPos.set(p.x,p.y,p.z);pQuat.set(o.x,o.y,o.z,o.w);}}
+  else if(frame){const vp=frame.getViewerPose(renderer.xr.getReferenceSpace());if(vp){const p=vp.transform.position,o=vp.transform.orientation;pPos.set(p.x,p.y,p.z);pQuat.set(o.x,o.y,o.z,o.w);B.poseOK=true;}}
   pFwd.set(0,0,-1).applyQuaternion(pQuat);invQ.copy(pQuat).invert();
   updReticle(frame);
   if(G.phase==='night')updGame(dt);
